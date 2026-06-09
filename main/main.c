@@ -35,6 +35,12 @@ const int BTN_PIN_HOVERBOARD = 2; //blue
 const int BTN_PIN_IMU = 5; //white
 const int BTN_PIN_START = 4; //green
 
+const int PIN_VIBRA = 18; //Vibra
+
+/* Janela de debounce dos botões: toques (bounce) dentro deste intervalo
+ * no mesmo pino são descartados, garantindo 1 evento por aperto. */
+#define DEBOUNCE_MS   200
+
 // LED RGB catodo comum; PWM 8 bits, resistor serie 220-330R.
 #define RGB_PIN_R   13
 #define RGB_PIN_G   14
@@ -72,6 +78,26 @@ const int BTN_PIN_START = 4; //green
 #define INVERT_ROLL     1
 #define INVERT_PITCH    0
 
+/* Calibração do centro/neutro por média: descarta CAL_SETTLE_SAMPLES
+ * amostras iniciais (deixa o AHRS assentar) e tira a média das
+ * CAL_AVG_SAMPLES seguintes. A 100 Hz dá ~0,7 s, com o controle parado. */
+#define CAL_SETTLE_SAMPLES   20
+#define CAL_AVG_SAMPLES      50
+
+/* ─────────────── Status / conexão (caminho RX, PC → Controle) ────────
+ * O controle envia HEARTBEAT periódico; o PC responde CONNECTED. Se
+ * nenhum CONNECTED chegar dentro de CONN_TIMEOUT_MS, o status_task
+ * considera o controle desconectado. */
+#define HEARTBEAT_PERIOD_MS  1000
+#define CONN_TIMEOUT_MS      2500
+#define STATUS_PERIOD_MS     50    /* período de atualização do LED */
+#define STATUS_BLINK_TICKS   2     /* meio-período do pisca (×STATUS_PERIOD_MS) */
+#define DEATH_RED_MS         1500  /* tempo de LED vermelho ao morrer */
+
+/* ─────────────────────── Feedback háptico (motor GP18) ──────────────── */
+#define VIBRA_SHORT_MS       80    /* pulso de eventos locais */
+#define VIBRA_LONG_MS        400   /* pulso da morte do jogador */
+
 /* ─────────────────── Comandos de jogo (fila compartilhada) ──────── */
 /*
  * Tipo compartilhado entre mpu_task e (futuramente) btn_task: ambas
@@ -101,75 +127,88 @@ typedef struct {
     char text[16];
 } uart_msg_t;
 
+/* Eventos enviados ao status_task (dono único do LED). A desconexão é
+ * inferida por timeout, mas também pode chegar explícita do PC. */
+typedef enum {
+    STATUS_CONNECTED = 0,
+    STATUS_DISCONNECTED,
+    STATUS_CAL_BEGIN,
+    STATUS_CAL_END,
+    STATUS_PLAYER_DIED,
+} status_evt_t;
+
+/* Padrões de vibração tocados pelo feedback_task (dono do motor). */
+typedef enum {
+    FEEDBACK_SHORT = 0,   /* eventos locais: hoverboard, start, calibrado, conexão */
+    FEEDBACK_LONG,        /* morte do jogador */
+} feedback_evt_t;
+
 /* ───────────────────── Filas e semáforos ────────────────────────── */
 QueueHandle_t xQueueBtn;
 QueueHandle_t xQueueGameCmd;
 QueueHandle_t xQueueUartTx;
+QueueHandle_t xQueueStatus;
+QueueHandle_t xQueueFeedback;
 SemaphoreHandle_t xSemaphoreCalibrateImu;
+
+/* Helper de LED RGB (cátodo comum: nível alto acende). */
+static void set_rgb(bool r, bool g, bool b) {
+    gpio_put(RGB_PIN_R, r);
+    gpio_put(RGB_PIN_G, g);
+    gpio_put(RGB_PIN_B, b);
+}
 
 /* ════════════════════════ Botões (ISR + task) ═══════════════════════ */
 
+/* Último instante (ms desde o boot) aceito por pino, para o debounce.
+ * 30 = nº de GPIOs do banco 0 no RP2040/RP2350; indexado pelo gpio. */
+static volatile uint32_t last_press_ms[30];
+
 void btn_callback(uint gpio, uint32_t events) {
     if (events == GPIO_IRQ_EDGE_FALL) {
+        /* Debounce na ISR: descarta quiques dentro de DEBOUNCE_MS antes
+         * de ocupar a fila, garantindo 1 evento por aperto. */
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (now - last_press_ms[gpio] < DEBOUNCE_MS) {
+            return;
+        }
+        last_press_ms[gpio] = now;
+
         /* ISR curta: apenas publica o GPIO acionado na fila.
          * (xQueueSendFromISR exige ponteiro para o item, por isso a var.) */
         uint32_t pin = gpio;
         BaseType_t higher_priority_woken = pdFALSE;
         xQueueSendFromISR(xQueueBtn, &pin, &higher_priority_woken);
         portYIELD_FROM_ISR(higher_priority_woken);
-    }           
+    }
 }
 
 void btn_task(void *p) {
     (void)p;
     uint32_t btn = 0;
     game_cmd_t cmd;
-    //Led
-    int delay = 200;
     while (true) {
         if (xQueueReceive(xQueueBtn, &btn, portMAX_DELAY)) {
+            /* O LED é responsabilidade exclusiva do status_task; aqui só
+             * publicamos comandos de jogo ou o pedido de recalibração. */
             if (btn == (uint32_t)BTN_PIN_PAUSE) {
-                // Pausa o jogo
-                // Indica com o led em amarelo
                 cmd = GAME_CMD_PAUSE;
                 xQueueSend(xQueueGameCmd, &cmd, 0);
-                // Indica com o led (em amarelo)
-                gpio_put(RGB_PIN_R, 1);
-                vTaskDelay(pdMS_TO_TICKS(delay));
-                gpio_put(RGB_PIN_R, 0);
-
             } else if (btn == (uint32_t)BTN_PIN_HOVERBOARD) {
-                // Ativa o Hoverboard
-                // Indica com o led verde que o hoverboard está ativado
                 cmd = GAME_CMD_HOVERBOARD;
                 xQueueSend(xQueueGameCmd, &cmd, 0);
-
-                // Indica com o led (em amarelo)
-                gpio_put(RGB_PIN_B, 1);
-                vTaskDelay(pdMS_TO_TICKS(delay));
-                gpio_put(RGB_PIN_B, 0);
-
-            } else if (btn ==  (uint32_t)BTN_PIN_START){
+                feedback_evt_t fb = FEEDBACK_SHORT;
+                xQueueSend(xQueueFeedback, &fb, 0);
+            } else if (btn == (uint32_t)BTN_PIN_START) {
                 cmd = GAME_CMD_START;
                 xQueueSend(xQueueGameCmd, &cmd, 0);
-
-                // Indica com o led (em amarelo)
-                gpio_put(RGB_PIN_G, 1);
-                vTaskDelay(pdMS_TO_TICKS(delay));
-                gpio_put(RGB_PIN_G, 0);
-            }
-            else {// Botão de reset da IMU
-                // Pede recalibração para a mpu_task
+                feedback_evt_t fb = FEEDBACK_SHORT;
+                xQueueSend(xQueueFeedback, &fb, 0);
+            } else if (btn == (uint32_t)BTN_PIN_IMU) {
+                /* Botão Reset IMU: pede recalibração à mpu_task. O feedback
+                 * visual (pisca branco → verde) é dado pela própria mpu_task,
+                 * que conhece o início e o fim da calibração. */
                 xSemaphoreGive(xSemaphoreCalibrateImu);
-
-                // Indica com o led (em amarelo)
-                gpio_put(RGB_PIN_G, 1);
-                gpio_put(RGB_PIN_R, 1);
-                gpio_put(RGB_PIN_B, 1);
-                vTaskDelay(pdMS_TO_TICKS(delay));
-                gpio_put(RGB_PIN_G, 0);
-                gpio_put(RGB_PIN_R, 0);
-                gpio_put(RGB_PIN_B, 0);
             }
         }
     }
@@ -228,21 +267,35 @@ void mpu_task(void *p) {
     };
     FusionAhrsSetSettings(&ahrs, &settings);
 
-    /* Centro/neutro da calibração e flag de "capturar centro". */
+    /* Centro/neutro (média) e estado da calibração. */
     float roll_center = 0.0f, pitch_center = 0.0f;
-    bool capture_center = true; /* calibra na primeira amostra estável */
+    bool calibrating = true;   /* calibra automaticamente no boot */
+    int cal_iter = 0;          /* amostras decorridas na calibração atual */
+    int cal_used = 0;          /* amostras efetivamente somadas na média */
+    float roll_sum = 0.0f, pitch_sum = 0.0f;
 
     /* Estado de histerese por eixo: -1 (esq/baixo), 0 (centro), +1 (dir/cima) */
     int roll_state = 0;
     int pitch_state = 0;
 
+    /* Calibração de boot já está ativa (calibrating = true): avisa o LED. */
+    status_evt_t cal_evt = STATUS_CAL_BEGIN;
+    xQueueSend(xQueueStatus, &cal_evt, 0);
+
     TickType_t last_wake = xTaskGetTickCount();
     int dbg_count = 0; /* contador para throttle do print de debug */
 
     for (;;) {
-        /* Pedido de recalibração vindo do botão Reset IMU (não bloqueia). */
+        /* Pedido de recalibração vindo do botão Reset IMU (não bloqueia):
+         * reinicia o acumulador para uma nova média. */
         if (xSemaphoreTake(xSemaphoreCalibrateImu, 0) == pdTRUE) {
-            capture_center = true;
+            calibrating = true;
+            cal_iter = 0;
+            cal_used = 0;
+            roll_sum = 0.0f;
+            pitch_sum = 0.0f;
+            cal_evt = STATUS_CAL_BEGIN;
+            xQueueSend(xQueueStatus, &cal_evt, 0);
         }
 
         int16_t raw_a[3], raw_g[3];
@@ -272,12 +325,33 @@ void mpu_task(void *p) {
         pitch = -pitch;
 #endif
 
-        if (capture_center) {
-            roll_center = roll;
-            pitch_center = pitch;
-            capture_center = false;
-            roll_state = 0;
-            pitch_state = 0;
+        /* ── Calibração por média (LED tratado pelo status_task) ─────── */
+        if (calibrating) {
+            /* Só acumula após o tempo de assentamento do AHRS. */
+            if (cal_iter >= CAL_SETTLE_SAMPLES) {
+                roll_sum += roll;
+                pitch_sum += pitch;
+                cal_used++;
+            }
+            cal_iter++;
+
+            if (cal_iter >= CAL_SETTLE_SAMPLES + CAL_AVG_SAMPLES) {
+                roll_center = roll_sum / (float)cal_used;
+                pitch_center = pitch_sum / (float)cal_used;
+                calibrating = false;
+                roll_state = 0;
+                pitch_state = 0;
+                cal_evt = STATUS_CAL_END;
+                xQueueSend(xQueueStatus, &cal_evt, 0);
+                feedback_evt_t fb = FEEDBACK_SHORT;
+                xQueueSend(xQueueFeedback, &fb, 0);
+                DBG("[MPU] calibrado: roll_c=%.1f pitch_c=%.1f\n",
+                    roll_center, pitch_center);
+            }
+
+            /* Enquanto calibra, não detecta inclinação. */
+            vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(MPU_PERIOD_MS));
+            continue;
         }
 
         float roll_rel = roll - roll_center;
@@ -386,6 +460,153 @@ void uart_tx_task(void *p) {
     }
 }
 
+/* ════════════════════════════════════════════════════════════════════
+ * status_task — ÚNICO dono do LED RGB. Mantém o estado de conexão e de
+ * calibração e renderiza o LED por prioridade:
+ *   calibrando → pisca branco; conectado → verde; senão → vermelho.
+ * Recebe eventos por xQueueStatus e infere desconexão por timeout do
+ * heartbeat (sem CONNECTED dentro de CONN_TIMEOUT_MS).
+ * ════════════════════════════════════════════════════════════════════ */
+void status_task(void *p) {
+    (void)p;
+    bool connected = false;
+    bool calibrating = false;
+    uint32_t last_conn_ms = 0;
+    uint32_t death_until_ms = 0;   /* enquanto now < isto, LED fica vermelho */
+    int blink = 0;
+    TickType_t last_wake = xTaskGetTickCount();
+
+    for (;;) {
+        /* Drena todos os eventos pendentes (não bloqueia). */
+        status_evt_t e;
+        while (xQueueReceive(xQueueStatus, &e, 0) == pdTRUE) {
+            switch (e) {
+                case STATUS_CONNECTED:
+                    if (!connected) {
+                        /* Borda de subida: avisa o háptico (conexão estabelecida). */
+                        feedback_evt_t fb = FEEDBACK_SHORT;
+                        xQueueSend(xQueueFeedback, &fb, 0);
+                    }
+                    connected = true;
+                    last_conn_ms = to_ms_since_boot(get_absolute_time());
+                    break;
+                case STATUS_DISCONNECTED:
+                    connected = false;
+                    break;
+                case STATUS_CAL_BEGIN:
+                    calibrating = true;
+                    break;
+                case STATUS_CAL_END:
+                    calibrating = false;
+                    break;
+                case STATUS_PLAYER_DIED:
+                    death_until_ms =
+                        to_ms_since_boot(get_absolute_time()) + DEATH_RED_MS;
+                    break;
+            }
+        }
+
+        /* Timeout do heartbeat: sem CONNECTED recente → desconectado. */
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (connected && (now - last_conn_ms > CONN_TIMEOUT_MS)) {
+            connected = false;
+        }
+
+        /* Renderização por prioridade: calibrando > morte > conectado > off. */
+        if (calibrating) {
+            bool on = ((blink / STATUS_BLINK_TICKS) % 2) == 0;
+            set_rgb(on, on, on);            /* branco piscando */
+        } else if (now < death_until_ms) {
+            set_rgb(true, false, false);    /* vermelho: morte do jogador */
+        } else if (connected) {
+            set_rgb(false, true, false);    /* verde: conectado */
+        } else {
+            set_rgb(true, true, false);    /* amarelo: desconectado */
+        }
+        blink++;
+
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(STATUS_PERIOD_MS));
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * uart_rx_task — lê mensagens do PC pela serial USB, separa por EOP e
+ * interpreta os comandos. Por ora trata CONNECTED/DISCONNECTED e os
+ * encaminha como eventos para o status_task.
+ * ════════════════════════════════════════════════════════════════════ */
+void uart_rx_task(void *p) {
+    (void)p;
+    char line[32];
+    int idx = 0;
+
+    for (;;) {
+        int c = getchar_timeout_us(0);  /* não bloqueia */
+        if (c == PICO_ERROR_TIMEOUT) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        if (c == EOP) {
+            line[idx] = '\0';
+            idx = 0;
+            status_evt_t e;
+            if (strcmp(line, "CONNECTED") == 0) {
+                e = STATUS_CONNECTED;
+                xQueueSend(xQueueStatus, &e, 0);
+            } else if (strcmp(line, "DISCONNECTED") == 0) {
+                e = STATUS_DISCONNECTED;
+                xQueueSend(xQueueStatus, &e, 0);
+            } else if (strcmp(line, "PLAYER_DIED") == 0) {
+                /* Evento vindo do PC: pisca vermelho + vibração longa. */
+                e = STATUS_PLAYER_DIED;
+                xQueueSend(xQueueStatus, &e, 0);
+                feedback_evt_t fb = FEEDBACK_LONG;
+                xQueueSend(xQueueFeedback, &fb, 0);
+            }
+        } else if (idx < (int)sizeof(line) - 1) {
+            line[idx++] = (char)c;
+        } else {
+            idx = 0; /* linha longa demais: descarta */
+        }
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * heartbeat_task — envia HEARTBEAT periódico ao PC. O PC responde
+ * CONNECTED, o que mantém o status_task no estado "conectado".
+ * ════════════════════════════════════════════════════════════════════ */
+void heartbeat_task(void *p) {
+    (void)p;
+    uart_msg_t hb;
+    strncpy(hb.text, "HEARTBEAT", sizeof(hb.text) - 1);
+    hb.text[sizeof(hb.text) - 1] = '\0';
+    TickType_t last_wake = xTaskGetTickCount();
+
+    for (;;) {
+        xQueueSend(xQueueUartTx, &hb, 0);
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(HEARTBEAT_PERIOD_MS));
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * feedback_task — ÚNICO dono do motor de vibração (GP18). Recebe eventos
+ * por xQueueFeedback e toca um pulso: curto para eventos locais, longo
+ * para a morte do jogador. Só esta task bloqueia durante o pulso, então
+ * o resto do sistema não trava.
+ * ════════════════════════════════════════════════════════════════════ */
+void feedback_task(void *p) {
+    (void)p;
+    feedback_evt_t e;
+    for (;;) {
+        if (xQueueReceive(xQueueFeedback, &e, portMAX_DELAY)) {
+            int ms = (e == FEEDBACK_LONG) ? VIBRA_LONG_MS : VIBRA_SHORT_MS;
+            gpio_put(PIN_VIBRA, 1);
+            vTaskDelay(pdMS_TO_TICKS(ms));
+            gpio_put(PIN_VIBRA, 0);
+        }
+    }
+}
+
 int main(void) {
     /* Inicializações de stdio, botões e LED */
     stdio_init_all();
@@ -401,6 +622,11 @@ int main(void) {
     gpio_init(RGB_PIN_G);
     gpio_set_dir(RGB_PIN_G, GPIO_OUT);
     gpio_put(RGB_PIN_G, 0);
+
+    /* Motor de vibração (ativo em nível alto). */
+    gpio_init(PIN_VIBRA);
+    gpio_set_dir(PIN_VIBRA, GPIO_OUT);
+    gpio_put(PIN_VIBRA, 0);
 
     gpio_init(BTN_PIN_PAUSE);
     gpio_set_dir(BTN_PIN_PAUSE, GPIO_IN);
@@ -428,6 +654,8 @@ int main(void) {
     xQueueBtn = xQueueCreate(32, sizeof(uint32_t));
     xQueueGameCmd = xQueueCreate(32, sizeof(game_cmd_t));
     xQueueUartTx = xQueueCreate(32, sizeof(uart_msg_t));
+    xQueueStatus = xQueueCreate(16, sizeof(status_evt_t));
+    xQueueFeedback = xQueueCreate(16, sizeof(feedback_evt_t));
     xSemaphoreCalibrateImu = xSemaphoreCreateBinary();
 
     /* Tasks */
@@ -435,6 +663,10 @@ int main(void) {
     xTaskCreate(btn_task, "btn task", 4096, NULL, 2, NULL);
     xTaskCreate(game_command_task, "gamecmd", 2048, NULL, 2, NULL);
     xTaskCreate(uart_tx_task, "uarttx", 2048, NULL, 2, NULL);
+    xTaskCreate(uart_rx_task, "uartrx", 2048, NULL, 2, NULL);
+    xTaskCreate(status_task, "status", 1024, NULL, 2, NULL);
+    xTaskCreate(heartbeat_task, "hbeat", 512, NULL, 1, NULL);
+    xTaskCreate(feedback_task, "feedback", 512, NULL, 2, NULL);
 
     vTaskStartScheduler();
 
