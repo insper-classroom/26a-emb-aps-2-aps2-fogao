@@ -5,14 +5,24 @@
 
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 
 #include "mpu6050.h"
 #include "Fusion.h"
-#include "hardware/pwm.h"
 #include "hardware/gpio.h"
+
+/* DEBUG_PRINT=1 liga os prints de bancada no console USB.
+ * Mantenha 0 ao jogar: a serial USB precisa transportar APENAS o
+ * protocolo, senão o parser do PC recebe lixo misturado. */
+#define DEBUG_PRINT 0
+#if DEBUG_PRINT
+#define DBG(...) printf(__VA_ARGS__)
+#else
+#define DBG(...) ((void)0)
+#endif
 
 
 
@@ -59,7 +69,7 @@ const int BTN_PIN_START = 4; //green
  */
 #define TILT_ENTER_DEG  20.0f
 #define TILT_EXIT_DEG   10.0f
-#define INVERT_ROLL     0
+#define INVERT_ROLL     1
 #define INVERT_PITCH    0
 
 /* ─────────────────── Comandos de jogo (fila compartilhada) ──────── */
@@ -79,9 +89,22 @@ typedef enum {
     GAME_CMD_HOVERBOARD,
 } game_cmd_t;
 
+/* ───────────────────────── Protocolo (Controle → PC) ────────────────
+ * Cada mensagem é um token de texto terminado por EOP. O script Python
+ * lê a serial, separa por EOP e simula a tecla correspondente no jogo.
+ * Mantenha estes tokens em sincronia com pc/controller.py e o README. */
+#define EOP '\n'
+
+/* Mensagem que trafega de game_command_task → uart_tx_task. Carrega o
+ * token já pronto; "HOVERBOARD" (10) é o maior, então 16 sobra. */
+typedef struct {
+    char text[16];
+} uart_msg_t;
+
 /* ───────────────────── Filas e semáforos ────────────────────────── */
 QueueHandle_t xQueueBtn;
 QueueHandle_t xQueueGameCmd;
+QueueHandle_t xQueueUartTx;
 SemaphoreHandle_t xSemaphoreCalibrateImu;
 
 /* ════════════════════════ Botões (ISR + task) ═══════════════════════ */
@@ -264,7 +287,7 @@ void mpu_task(void *p) {
          * acompanhar os ângulos e ajustar TILT_ENTER_DEG sem floodar. */
         if (++dbg_count >= MPU_SAMPLE_HZ / 2) {
             dbg_count = 0;
-            printf("[MPU] roll=%.1f pitch=%.1f\n", roll_rel, pitch_rel);
+            DBG("[MPU] roll=%.1f pitch=%.1f\n", roll_rel, pitch_rel);
         }
 
         /* ── Eixo roll → MOVE_RIGHT (>0) / MOVE_LEFT (<0) ──────────── */
@@ -273,19 +296,13 @@ void mpu_task(void *p) {
                 roll_state = 1;
                 game_cmd_t cmd = GAME_CMD_MOVE_RIGHT;
                 xQueueSend(xQueueGameCmd, &cmd, 0);
-
-                //Debug
-                printf("Virou para a direita\n");
-                //
+                DBG("Virou para a direita\n");
 
             } else if (roll_rel < -TILT_ENTER_DEG) {
                 roll_state = -1;
                 game_cmd_t cmd = GAME_CMD_MOVE_LEFT;
                 xQueueSend(xQueueGameCmd, &cmd, 0);
-
-                //Debug
-                printf("Virou para a esquerda\n");
-                //
+                DBG("Virou para a esquerda\n");
             }
         } else if (fabsf(roll_rel) < TILT_EXIT_DEG) {
             roll_state = 0; /* voltou ao centro: rearma */
@@ -297,18 +314,12 @@ void mpu_task(void *p) {
                 pitch_state = 1;
                 game_cmd_t cmd = GAME_CMD_JUMP;
                 xQueueSend(xQueueGameCmd, &cmd, 0);
-
-                //Debug
-                printf("Pulou!\n");
-                //
+                DBG("Pulou!\n");
             } else if (pitch_rel < -TILT_ENTER_DEG) {
                 pitch_state = -1;
                 game_cmd_t cmd = GAME_CMD_ROLL;
                 xQueueSend(xQueueGameCmd, &cmd, 0);
-
-                //Debug
-                printf("Rolou!\n");
-                //
+                DBG("Rolou!\n");
             }
         } else if (fabsf(pitch_rel) < TILT_EXIT_DEG) {
             pitch_state = 0; /* voltou ao centro: rearma */
@@ -316,6 +327,62 @@ void mpu_task(void *p) {
 
         /* Período fixo de amostragem (não acumula jitter). */
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(MPU_PERIOD_MS));
+    }
+}
+
+/* ══════════════════════ Protocolo: comando → token ══════════════════ */
+/* Traduz um game_cmd_t no token de texto enviado ao PC. Retorna NULL
+ * para comandos que não têm representação no protocolo de saída. */
+static const char *cmd_to_token(game_cmd_t cmd) {
+    switch (cmd) {
+        case GAME_CMD_MOVE_LEFT:  return "MOVE_LEFT";
+        case GAME_CMD_MOVE_RIGHT: return "MOVE_RIGHT";
+        case GAME_CMD_JUMP:       return "JUMP";
+        case GAME_CMD_ROLL:       return "ROLL";
+        case GAME_CMD_START:      return "START";
+        case GAME_CMD_PAUSE:      return "PAUSE";
+        case GAME_CMD_HOVERBOARD: return "HOVERBOARD";
+        case GAME_CMD_RESET_IMU:  return "RESET_IMU";
+        default:                  return NULL;
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * game_command_task — consome os comandos de alto nível publicados por
+ * mpu_task e btn_task na xQueueGameCmd, converte para o token do
+ * protocolo e encaminha para uart_tx_task. Centraliza a "tradução" de
+ * evento de jogo → mensagem de fio num único ponto.
+ * ════════════════════════════════════════════════════════════════════ */
+void game_command_task(void *p) {
+    (void)p;
+    game_cmd_t cmd;
+    uart_msg_t out;
+    for (;;) {
+        if (xQueueReceive(xQueueGameCmd, &cmd, portMAX_DELAY)) {
+            const char *token = cmd_to_token(cmd);
+            if (token == NULL) {
+                continue; /* comando sem token: nada a enviar */
+            }
+            strncpy(out.text, token, sizeof(out.text) - 1);
+            out.text[sizeof(out.text) - 1] = '\0';
+            xQueueSend(xQueueUartTx, &out, 0);
+        }
+    }
+}
+
+/* ════════════════════════════════════════════════════════════════════
+ * uart_tx_task — ÚNICO escritor da serial USB. Recebe mensagens prontas
+ * e as envia como TOKEN + EOP. Concentrar a escrita numa só task evita
+ * que prints de tasks diferentes se intercalem no mesmo fluxo.
+ * ════════════════════════════════════════════════════════════════════ */
+void uart_tx_task(void *p) {
+    (void)p;
+    uart_msg_t msg;
+    for (;;) {
+        if (xQueueReceive(xQueueUartTx, &msg, portMAX_DELAY)) {
+            printf("%s%c", msg.text, EOP);
+            stdio_flush(); /* envia já, sem esperar encher o buffer */
+        }
     }
 }
 
@@ -360,11 +427,14 @@ int main(void) {
     /* Filas e semáforos */
     xQueueBtn = xQueueCreate(32, sizeof(uint32_t));
     xQueueGameCmd = xQueueCreate(32, sizeof(game_cmd_t));
+    xQueueUartTx = xQueueCreate(32, sizeof(uart_msg_t));
     xSemaphoreCalibrateImu = xSemaphoreCreateBinary();
 
     /* Tasks */
     xTaskCreate(mpu_task, "mpu", 4096, NULL, 2, NULL);
     xTaskCreate(btn_task, "btn task", 4096, NULL, 2, NULL);
+    xTaskCreate(game_command_task, "gamecmd", 2048, NULL, 2, NULL);
+    xTaskCreate(uart_tx_task, "uarttx", 2048, NULL, 2, NULL);
 
     vTaskStartScheduler();
 
