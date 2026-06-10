@@ -14,6 +14,9 @@
 #include "Fusion.h"
 #include "hardware/gpio.h"
 
+#include "power_up.h"
+#include "pause.h"
+
 /* DEBUG_PRINT=1 liga os prints de bancada no console USB.
  * Mantenha 0 ao jogar: a serial USB precisa transportar APENAS o
  * protocolo, senão o parser do PC recebe lixo misturado. */
@@ -36,6 +39,8 @@ const int BTN_PIN_IMU = 5; //white
 const int BTN_PIN_START = 4; //green
 
 const int PIN_VIBRA = 18; //Vibra
+
+const int AUDIO_PIN = 28; // audio
 
 /* Janela de debounce dos botões: toques (bounce) dentro deste intervalo
  * no mesmo pino são descartados, garantindo 1 evento por aperto. */
@@ -163,6 +168,30 @@ static void set_rgb(bool r, bool g, bool b) {
 /* Último instante (ms desde o boot) aceito por pino, para o debounce.
  * 30 = nº de GPIOs do banco 0 no RP2040/RP2350; indexado pelo gpio. */
 static volatile uint32_t last_press_ms[30];
+
+volatile int wav_position_pause = 0;
+volatile bool pause = false;
+volatile int wav_position_power_up = 0;
+volatile bool prancha = false;
+
+void pwm_interrupt_handler() {
+    pwm_clear_irq(pwm_gpio_to_slice_num(AUDIO_PIN));    
+    if (pause){
+        if (wav_position_pause < (WAV_DATA_LENGTH_PAUSE<<3) - 1) { 
+            // set pwm level 
+            // allow the pwm value to repeat for 8 cycles this is >>3 
+            pwm_set_gpio_level(AUDIO_PIN, WAV_DATA_PAUSE[wav_position_pause>>3]);  
+            wav_position_pause++;
+        }
+    } else if (prancha){
+        if (wav_position_power_up < (WAV_DATA_LENGTH_POWER_UP<<3) - 1) { 
+            // set pwm level 
+            // allow the pwm value to repeat for 8 cycles this is >>3 
+            pwm_set_gpio_level(AUDIO_PIN, WAV_DATA_POWER_UP[wav_position_power_up>>3]);  
+            wav_position_power_up++;
+        }
+    }
+}
 
 void btn_callback(uint gpio, uint32_t events) {
     if (events == GPIO_IRQ_EDGE_FALL) {
@@ -611,6 +640,35 @@ int main(void) {
     /* Inicializações de stdio, botões e LED */
     stdio_init_all();
 
+    set_sys_clock_khz(176000, true); 
+    gpio_set_function(AUDIO_PIN, GPIO_FUNC_PWM);
+    int audio_pin_slice = pwm_gpio_to_slice_num(AUDIO_PIN);
+    // Setup PWM interrupt to fire when PWM cycle is complete
+    pwm_clear_irq(audio_pin_slice);
+    pwm_set_irq_enabled(audio_pin_slice, true);
+    // set the handle function above
+    irq_set_exclusive_handler(PWM_IRQ_WRAP, pwm_interrupt_handler); 
+    irq_set_enabled(PWM_IRQ_WRAP, true);
+
+    // Setup PWM for audio output
+    pwm_config config = pwm_get_default_config();
+    /* Base clock 176,000,000 Hz divide by wrap 250 then the clock divider further divides
+     * to set the interrupt rate. 
+     * 
+     * 11 KHz is fine for speech. Phone lines generally sample at 8 KHz
+     * 
+     * 
+     * So clkdiv should be as follows for given sample rate
+     *  8.0f for 11 KHz
+     *  4.0f for 22 KHz
+     *  2.0f for 44 KHz etc
+     */
+    pwm_config_set_clkdiv(&config, 8.0f); 
+    pwm_config_set_wrap(&config, 255); 
+    pwm_init(audio_pin_slice, &config, true);
+
+    pwm_set_gpio_level(AUDIO_PIN, 0);
+
     gpio_init(RGB_PIN_R);
     gpio_set_dir(RGB_PIN_R, GPIO_OUT);
     gpio_put(RGB_PIN_R, 0);
@@ -671,5 +729,7 @@ int main(void) {
     vTaskStartScheduler();
 
     // Should never reach here
-    for (;;);
+    while(1) {
+        __wfi(); // Wait for Interrupt
+    }
 }
