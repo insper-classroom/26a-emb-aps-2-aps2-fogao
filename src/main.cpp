@@ -43,21 +43,6 @@ run_classifier(ei::signal_t *signal, ei_impulse_result_t *result, bool debug);
 
 static bool debug_nn = false;
 
-const int MPU_ADDRESS = 0x68;
-const int I2C_SDA_GPIO = 17;
-const int I2C_SCL_GPIO = 16;
-const int LED_R_rgb = 27;
-const int LED_G_rgb = 26;
-const int LED_B_rgb = 21;
-const int LED_B = 18;
-const int LED_G = 19;
-const int LED_R = 20;
-const int BTN_PIN_G = 6;
-const int BTN_PIN_R = 7;
-const int BTN_PIN_Y = 8;
-
-
-
 QueueHandle_t xQueueClass, xQueueBtn;
 
 static void mpu6050_init()
@@ -152,10 +137,10 @@ static void gesture_recognize_task(void *p)
                 result.classification[ix].value);
                 int value;
                 if (result.classification[ix].value > 0.5){
-                    if (result.classification[ix].label == "idle"){
+                    if (result.classification[ix].label == "prancha"){
                         value = 1;
                     }
-                    else if (result.classification[ix].label == "wave"){
+                    else if (result.classification[ix].label == "pular"){
                         value = 2;
                     }
                     else {
@@ -168,90 +153,6 @@ static void gesture_recognize_task(void *p)
 #if EI_CLASSIFIER_HAS_ANOMALY == 1
         ei_printf("    anomaly score: %.3f\n", result.anomaly);
 #endif
-    }
-}
-
-void btn_callback(uint gpio, uint32_t events) {
-    int i;
-    if (gpio==BTN_PIN_R) {
-        i = BTN_PIN_R;
-    } else if (gpio==BTN_PIN_Y) {
-        i = BTN_PIN_Y;
-    }
-    else if (gpio==BTN_PIN_G) {
-        i = BTN_PIN_G;
-    }
-    xQueueSendFromISR(xQueueBtn, &i, 0);
-}
-
-void btn_task(void* p) {
-    gpio_init(BTN_PIN_R);
-    gpio_set_dir(BTN_PIN_R, GPIO_IN);
-    gpio_pull_up(BTN_PIN_R);
-    gpio_set_irq_enabled_with_callback(BTN_PIN_R, GPIO_IRQ_EDGE_FALL, true,
-                                       &btn_callback);
-    gpio_init(BTN_PIN_Y);
-    gpio_set_dir(BTN_PIN_Y, GPIO_IN);
-    gpio_pull_up(BTN_PIN_Y);
-    gpio_set_irq_enabled(BTN_PIN_Y,GPIO_IRQ_EDGE_FALL, true);
-
-    gpio_init(BTN_PIN_G);
-    gpio_set_dir(BTN_PIN_G, GPIO_IN);
-    gpio_pull_up(BTN_PIN_G);
-    gpio_set_irq_enabled(BTN_PIN_G,GPIO_IRQ_EDGE_FALL, true);
-    int gpio;
-    while (true) {
-        if (xQueueReceive(xQueueBtn, &gpio, 0)) {
-            if (gpio == BTN_PIN_R) {
-                printf("botao vermelho");
-            } else if (gpio == BTN_PIN_Y) {
-                printf("botao amarelo");
-            } else if (gpio == BTN_PIN_G){
-                printf("botao verde");
-            }
-        }
-    }
-}
-
-void led_task(void* p) {
-    gpio_init(LED_R_rgb);
-    gpio_set_dir(LED_R_rgb, GPIO_OUT);
-
-    gpio_init(LED_B_rgb);
-    gpio_set_dir(LED_B_rgb, GPIO_OUT);
-
-    gpio_init(LED_G_rgb);
-    gpio_set_dir(LED_G_rgb, GPIO_OUT);
-
-    gpio_init(LED_R);
-    gpio_set_dir(LED_R, GPIO_OUT);
-
-    gpio_init(LED_B);
-    gpio_set_dir(LED_B, GPIO_OUT);
-
-    gpio_init(LED_G);
-    gpio_set_dir(LED_G, GPIO_OUT);
-   
-    int value;
-    while (true) {
-        gpio_put(LED_B,1);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        gpio_put(LED_B,0);
-        gpio_put(LED_G,1);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        gpio_put(LED_G,0);
-        gpio_put(LED_R,1);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        gpio_put(LED_R,0);
-        gpio_put(LED_B_rgb,1);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        gpio_put(LED_B_rgb,0);
-        gpio_put(LED_R_rgb,1);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        gpio_put(LED_R_rgb,0);
-        gpio_put(LED_G_rgb,1);
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        gpio_put(LED_G_rgb,0);
     }
 }
 
