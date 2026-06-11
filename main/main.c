@@ -20,6 +20,8 @@
 #include "power_up.h"
 #include "pause.h"
 
+#include "integration.h"
+
 /* DEBUG_PRINT=1 liga os prints de bancada no console USB.
  * Mantenha 0 ao jogar: a serial USB precisa transportar APENAS o
  * protocolo, senão o parser do PC recebe lixo misturado. */
@@ -166,11 +168,26 @@ SemaphoreHandle_t xSemaphoreAudioPause;
 SemaphoreHandle_t xSemaphoreAudioPowerUp;
 QueueSetHandle_t  xAudioQueueSet;
 
+/* Mutex do barramento I2C: serializa os acessos à MPU6050 entre a mpu_task
+ * (tilt/Fusion) e a gesture_task (IA), que leem a mesma IMU. */
+SemaphoreHandle_t xMutexI2C;
+
 /* Helper de LED RGB (cátodo comum: nível alto acende). */
 static void set_rgb(bool r, bool g, bool b) {
     gpio_put(RGB_PIN_R, r);
     gpio_put(RGB_PIN_G, g);
     gpio_put(RGB_PIN_B, b);
+}
+
+/* Ação de prancha: publica HOVERBOARD na fila de jogo, toca o power_up e
+ * vibra. Ponto único acionado tanto pelo botão (btn_task) quanto pela IA
+ * (gesture_task, via integration.h). */
+void controller_trigger_hoverboard(void) {
+    game_cmd_t cmd = GAME_CMD_HOVERBOARD;
+    xQueueSend(xQueueGameCmd, &cmd, 0);
+    xSemaphoreGive(xSemaphoreAudioPowerUp);
+    feedback_evt_t fb = FEEDBACK_SHORT;
+    xQueueSend(xQueueFeedback, &fb, 0);
 }
 
 /* ════════════════════════ Botões (ISR + task) ═══════════════════════ */
@@ -241,11 +258,8 @@ void btn_task(void *p) {
                 xQueueSend(xQueueGameCmd, &cmd, 0);
                 xSemaphoreGive(xSemaphoreAudioPause); /* toca som de pausar */
             } else if (btn == (uint32_t)BTN_PIN_HOVERBOARD) {
-                cmd = GAME_CMD_HOVERBOARD;
-                xQueueSend(xQueueGameCmd, &cmd, 0);
-                xSemaphoreGive(xSemaphoreAudioPowerUp); /* toca som de power-up */
-                feedback_evt_t fb = FEEDBACK_SHORT;
-                xQueueSend(xQueueFeedback, &fb, 0);
+                /* Mesma ação que a IA dispara ao reconhecer a prancha. */
+                controller_trigger_hoverboard();
             } else if (btn == (uint32_t)BTN_PIN_START) {
                 cmd = GAME_CMD_START;
                 xQueueSend(xQueueGameCmd, &cmd, 0);
@@ -289,6 +303,19 @@ static void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3]) {
         gyro[i] = (int16_t)((buf[8 + i * 2] << 8) | buf[8 + i * 2 + 1]);
 }
 
+/* Leitura só do acelerômetro (6 bytes a partir de 0x3B), protegida pelo mutex
+ * de I2C. Exportada via integration.h para a gesture_task (IA). */
+void mpu_read_accel(int16_t accel[3]) {
+    uint8_t buf[6];
+    uint8_t reg = MPUREG_ACCEL_XOUT_H;
+    xSemaphoreTake(xMutexI2C, portMAX_DELAY);
+    i2c_write_blocking(I2C_PORT, MPU_ADDRESS, &reg, 1, true);
+    i2c_read_blocking(I2C_PORT, MPU_ADDRESS, buf, 6, false);
+    xSemaphoreGive(xMutexI2C);
+    for (int i = 0; i < 3; i++)
+        accel[i] = (int16_t)((buf[i * 2] << 8) | buf[i * 2 + 1]);
+}
+
 /* ════════════════════════════════════════════════════════════════════
  * mpu_task — lê a IMU a 100 Hz, roda Fusion AHRS para obter roll/pitch
  * e converte a inclinação em comandos de jogo (MOVE_LEFT/RIGHT, JUMP,
@@ -300,7 +327,7 @@ static void mpu6050_read_raw(int16_t accel[3], int16_t gyro[3]) {
  * ════════════════════════════════════════════════════════════════════ */
 void mpu_task(void *p) {
     (void)p;
-    mpu6050_init();
+    /* I2C/MPU já inicializada em main() antes do scheduler. */
 
     FusionAhrs ahrs;
     FusionAhrsInitialise(&ahrs);
@@ -346,7 +373,9 @@ void mpu_task(void *p) {
         }
 
         int16_t raw_a[3], raw_g[3];
+        xSemaphoreTake(xMutexI2C, portMAX_DELAY);
         mpu6050_read_raw(raw_a, raw_g);
+        xSemaphoreGive(xMutexI2C);
 
         FusionVector accel = {{
             raw_a[0] / ACCEL_SCALE,
@@ -765,6 +794,11 @@ int main(void) {
     xQueueAddToSet(xSemaphoreAudioPause, xAudioQueueSet);
     xQueueAddToSet(xSemaphoreAudioPowerUp, xAudioQueueSet);
 
+    /* Mutex de I2C + inicialização única da MPU (antes do scheduler, sem
+     * concorrência), compartilhada entre mpu_task e gesture_task. */
+    xMutexI2C = xSemaphoreCreateMutex();
+    mpu6050_init();
+
     /* Tasks */
     xTaskCreate(mpu_task, "mpu", 4096, NULL, 2, NULL);
     xTaskCreate(btn_task, "btn task", 4096, NULL, 2, NULL);
@@ -775,6 +809,8 @@ int main(void) {
     xTaskCreate(heartbeat_task, "hbeat", 512, NULL, 1, NULL);
     xTaskCreate(feedback_task, "feedback", 512, NULL, 2, NULL);
     xTaskCreate(audio_task, "audio", 1024, NULL, 2, NULL);
+    /* IA: prioridade baixa (1), abaixo do controle; stack grande p/ inferência. */
+    xTaskCreate(gesture_task, "gesture", 8192, NULL, 1, NULL);
 
     vTaskStartScheduler();
 
