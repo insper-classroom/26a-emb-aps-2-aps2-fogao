@@ -13,6 +13,7 @@
 #include "pico/stdlib.h"
 #include "task.h"
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
 // imu
@@ -43,7 +44,11 @@ run_classifier(ei::signal_t *signal, ei_impulse_result_t *result, bool debug);
 
 static bool debug_nn = false;
 
-QueueHandle_t xQueueClass, xQueueBtn;
+/* Protocolo Controle -> PC (mesmo do main/main.c): cada comando é um token
+ * de texto terminado por EOP. Apertar o botão de prancha no controlador
+ * envia "HOVERBOARD"; aqui a IA reproduz exatamente esse mesmo sinal. */
+#define EOP '\n'
+#define TOKEN_HOVERBOARD "HOVERBOARD"
 
 static void mpu6050_init()
 {
@@ -90,6 +95,11 @@ static void gesture_recognize_task(void *p)
     mpu6050_init();
     int16_t accelerometer[3], gyro[3], temp;
 
+    /* Estado de borda: a IA classifica continuamente, mas o botão gera UM
+     * evento por aperto. Só disparamos o sinal ao ENTRAR no gesto "prancha"
+     * (transição não-prancha -> prancha), evitando repetir a cada janela. */
+    bool prancha_active = false;
+
     while (true) {
         //        ei_printf("\nStarting inferencing in 2 seconds...\n");
         //        vTaskDelay(pdMS_TO_TICKS(2000));
@@ -130,25 +140,27 @@ static void gesture_recognize_task(void *p)
             result.timing.classification,
             result.timing.anomaly);
         ei_printf(": \n");
+        bool prancha_now = false;
         for (size_t ix = 0; ix < EI_CLASSIFIER_LABEL_COUNT; ix++) {
             ei_printf(
                 "teste    %s: %.5f\n",
                 result.classification[ix].label,
                 result.classification[ix].value);
-                int value;
-                if (result.classification[ix].value > 0.5){
-                    if (result.classification[ix].label == "prancha"){
-                        value = 1;
-                    }
-                    else if (result.classification[ix].label == "pular"){
-                        value = 2;
-                    }
-                    else {
-                        value = 3;
-                    }
-                    xQueueSend(xQueueClass, &value, 0);
-                }
+            /* strcmp: comparar strings por conteúdo. Usar '==' aqui
+             * compararia ponteiros e falharia silenciosamente. */
+            if (result.classification[ix].value > 0.75 &&
+                strcmp(result.classification[ix].label, "prancha") == 0) {
+                prancha_now = true;
+            }
         }
+
+        /* Mesmo sinal do botão de prancha, disparado pela IA. Só na borda de
+         * subida do gesto, para equivaler a um único aperto de botão. */
+        if (prancha_now && !prancha_active) {
+            printf("%s%c", TOKEN_HOVERBOARD, EOP);
+            stdio_flush();
+        }
+        prancha_active = prancha_now;
 
 #if EI_CLASSIFIER_HAS_ANOMALY == 1
         ei_printf("    anomaly score: %.3f\n", result.anomaly);
@@ -161,11 +173,7 @@ int main(void)
 {
     stdio_init_all();
 
-    xQueueClass = xQueueCreate(32, sizeof(int));
-    xQueueBtn = xQueueCreate(32, sizeof(int));
     xTaskCreate(gesture_recognize_task, "gesture_task 1", 8192, NULL, 1, NULL);
-    xTaskCreate(led_task, "led_task", 256, NULL, 2, NULL);
-    xTaskCreate(btn_task, "btn_task", 256, NULL, 2, NULL);
     vTaskStartScheduler();
 
     while (true)
