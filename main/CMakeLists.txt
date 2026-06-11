@@ -20,6 +20,7 @@ target_link_libraries(pico_emb PRIVATE
     pico_async_context_freertos
     FreeRTOS-Kernel-Heap4
     hardware_i2c
+    hardware_pwm
     Fusion
     pico_stdlib
     )

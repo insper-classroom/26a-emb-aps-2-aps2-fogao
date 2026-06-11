@@ -9,6 +9,9 @@
 
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
+#include "hardware/pwm.h"
+#include "hardware/irq.h"
+#include "hardware/clocks.h"
 
 #include "mpu6050.h"
 #include "Fusion.h"
@@ -156,6 +159,13 @@ QueueHandle_t xQueueStatus;
 QueueHandle_t xQueueFeedback;
 SemaphoreHandle_t xSemaphoreCalibrateImu;
 
+/* Áudio: um semáforo binário por som. O btn_task sinaliza (give) no aperto
+ * do botão e a audio_task espera nos dois ao mesmo tempo via queue set,
+ * substituindo as antigas flags globais por sinalização entre tasks. */
+SemaphoreHandle_t xSemaphoreAudioPause;
+SemaphoreHandle_t xSemaphoreAudioPowerUp;
+QueueSetHandle_t  xAudioQueueSet;
+
 /* Helper de LED RGB (cátodo comum: nível alto acende). */
 static void set_rgb(bool r, bool g, bool b) {
     gpio_put(RGB_PIN_R, r);
@@ -169,27 +179,33 @@ static void set_rgb(bool r, bool g, bool b) {
  * 30 = nº de GPIOs do banco 0 no RP2040/RP2350; indexado pelo gpio. */
 static volatile uint32_t last_press_ms[30];
 
-volatile int wav_position_pause = 0;
-volatile bool pause = false;
-volatile int wav_position_power_up = 0;
-volatile bool prancha = false;
+/* Estado lido pela PWM ISR para alimentar o DAC. A reprodução é armada
+ * pela audio_task (via audio_play); a ISR apenas avança a posição e
+ * silencia ao chegar no fim. Cada amostra é repetida 8x (>>3), igual ao
+ * driver original. Mantidos volatile por serem compartilhados com a ISR. */
+static volatile const uint8_t *audio_data  = NULL;
+static volatile uint32_t       audio_ticks = 0;   /* total de ciclos PWM = LENGTH<<3 */
+static volatile uint32_t       audio_pos   = 0;   /* ciclo atual */
+
+/* Arma a reprodução de um buffer. Chamado só pela audio_task (contexto de
+ * task). A ordem das escritas garante que a ISR nunca indexe o buffer novo
+ * com o comprimento antigo: primeiro estaciona a posição no fim (ISR ociosa),
+ * troca o buffer e só então libera com audio_pos = 0. */
+static void audio_play(const uint8_t *data, uint32_t length) {
+    audio_pos   = audio_ticks;   /* pos >= ticks ⇒ ISR não reproduz */
+    audio_data  = data;
+    audio_ticks = length << 3;
+    audio_pos   = 0;             /* libera a nova reprodução */
+}
 
 void pwm_interrupt_handler() {
-    pwm_clear_irq(pwm_gpio_to_slice_num(AUDIO_PIN));    
-    if (pause){
-        if (wav_position_pause < (WAV_DATA_LENGTH_PAUSE<<3) - 1) { 
-            // set pwm level 
-            // allow the pwm value to repeat for 8 cycles this is >>3 
-            pwm_set_gpio_level(AUDIO_PIN, WAV_DATA_PAUSE[wav_position_pause>>3]);  
-            wav_position_pause++;
-        }
-    } else if (prancha){
-        if (wav_position_power_up < (WAV_DATA_LENGTH_POWER_UP<<3) - 1) { 
-            // set pwm level 
-            // allow the pwm value to repeat for 8 cycles this is >>3 
-            pwm_set_gpio_level(AUDIO_PIN, WAV_DATA_POWER_UP[wav_position_power_up>>3]);  
-            wav_position_power_up++;
-        }
+    pwm_clear_irq(pwm_gpio_to_slice_num(AUDIO_PIN));
+    if (audio_pos < audio_ticks) {
+        /* repete cada amostra por 8 ciclos de PWM (>>3) */
+        pwm_set_gpio_level(AUDIO_PIN, audio_data[audio_pos >> 3]);
+        audio_pos++;
+    } else {
+        pwm_set_gpio_level(AUDIO_PIN, 0); /* silêncio ao terminar */
     }
 }
 
@@ -223,9 +239,11 @@ void btn_task(void *p) {
             if (btn == (uint32_t)BTN_PIN_PAUSE) {
                 cmd = GAME_CMD_PAUSE;
                 xQueueSend(xQueueGameCmd, &cmd, 0);
+                xSemaphoreGive(xSemaphoreAudioPause); /* toca som de pausar */
             } else if (btn == (uint32_t)BTN_PIN_HOVERBOARD) {
                 cmd = GAME_CMD_HOVERBOARD;
                 xQueueSend(xQueueGameCmd, &cmd, 0);
+                xSemaphoreGive(xSemaphoreAudioPowerUp); /* toca som de power-up */
                 feedback_evt_t fb = FEEDBACK_SHORT;
                 xQueueSend(xQueueFeedback, &fb, 0);
             } else if (btn == (uint32_t)BTN_PIN_START) {
@@ -636,6 +654,28 @@ void feedback_task(void *p) {
     }
 }
 
+/* ════════════════════════════════════════════════════════════════════
+ * audio_task — ÚNICA dona da reprodução. Bloqueia no queue set esperando
+ * qualquer um dos semáforos de áudio (pause/power-up). Ao ser sinalizada,
+ * arma o buffer correspondente via audio_play(); a PWM ISR cuida de
+ * alimentar o DAC amostra a amostra. Apertar um botão durante outro som
+ * apenas troca o buffer (o som novo recomeça do início).
+ * ════════════════════════════════════════════════════════════════════ */
+void audio_task(void *p) {
+    (void)p;
+    for (;;) {
+        QueueSetMemberHandle_t active =
+            xQueueSelectFromSet(xAudioQueueSet, portMAX_DELAY);
+        if (active == (QueueSetMemberHandle_t)xSemaphoreAudioPause) {
+            xSemaphoreTake(xSemaphoreAudioPause, 0);
+            audio_play(WAV_DATA_PAUSE, WAV_DATA_LENGTH_PAUSE);
+        } else if (active == (QueueSetMemberHandle_t)xSemaphoreAudioPowerUp) {
+            xSemaphoreTake(xSemaphoreAudioPowerUp, 0);
+            audio_play(WAV_DATA_POWER_UP, WAV_DATA_LENGTH_POWER_UP);
+        }
+    }
+}
+
 int main(void) {
     /* Inicializações de stdio, botões e LED */
     stdio_init_all();
@@ -647,8 +687,8 @@ int main(void) {
     pwm_clear_irq(audio_pin_slice);
     pwm_set_irq_enabled(audio_pin_slice, true);
     // set the handle function above
-    irq_set_exclusive_handler(PWM_IRQ_WRAP, pwm_interrupt_handler); 
-    irq_set_enabled(PWM_IRQ_WRAP, true);
+    irq_set_exclusive_handler(PWM_IRQ_WRAP_0, pwm_interrupt_handler); 
+    irq_set_enabled(PWM_IRQ_WRAP_0, true);
 
     // Setup PWM for audio output
     pwm_config config = pwm_get_default_config();
@@ -716,6 +756,15 @@ int main(void) {
     xQueueFeedback = xQueueCreate(16, sizeof(feedback_evt_t));
     xSemaphoreCalibrateImu = xSemaphoreCreateBinary();
 
+    /* Áudio: semáforos vazios (criados sem token) agrupados num queue set,
+     * para a audio_task esperar nos dois ao mesmo tempo. Os membros devem
+     * ser adicionados ao set antes de qualquer give. */
+    xSemaphoreAudioPause   = xSemaphoreCreateBinary();
+    xSemaphoreAudioPowerUp = xSemaphoreCreateBinary();
+    xAudioQueueSet = xQueueCreateSet(2);
+    xQueueAddToSet(xSemaphoreAudioPause, xAudioQueueSet);
+    xQueueAddToSet(xSemaphoreAudioPowerUp, xAudioQueueSet);
+
     /* Tasks */
     xTaskCreate(mpu_task, "mpu", 4096, NULL, 2, NULL);
     xTaskCreate(btn_task, "btn task", 4096, NULL, 2, NULL);
@@ -725,11 +774,10 @@ int main(void) {
     xTaskCreate(status_task, "status", 1024, NULL, 2, NULL);
     xTaskCreate(heartbeat_task, "hbeat", 512, NULL, 1, NULL);
     xTaskCreate(feedback_task, "feedback", 512, NULL, 2, NULL);
+    xTaskCreate(audio_task, "audio", 1024, NULL, 2, NULL);
 
     vTaskStartScheduler();
 
-    // Should never reach here
-    while(1) {
-        __wfi(); // Wait for Interrupt
-    }
+    // Should never reach here: o scheduler só retorna se falhar ao iniciar.
+    for (;;);
 }
