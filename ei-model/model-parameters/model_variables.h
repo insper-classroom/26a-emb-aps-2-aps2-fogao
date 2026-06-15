@@ -47,7 +47,7 @@
 #include "edge-impulse-sdk/classifier/inferencing_engines/engines.h"
 #include "edge-impulse-sdk/classifier/postprocessing/ei_postprocessing_common.h"
 
-const char* ei_classifier_inferencing_categories_1024993_1[] = { "prancha", "pular" };
+const char* ei_classifier_inferencing_categories_1024993_1[] = { "nao eh prancha", "prancha" };
 
 EI_CLASSIFIER_DSP_AXES_INDEX_TYPE ei_dsp_config_1024993_5_axes[] = { 0, 1, 2 };
 const uint32_t ei_dsp_config_1024993_5_axes_size = 3;
@@ -172,12 +172,12 @@ const ei_impulse_t impulse_1024993_1 = {
     .project_name = "APS-2",
     .impulse_id = 1,
     .impulse_name = "Impulse #1",
-    .deploy_version = 1,
+    .deploy_version = 2,
 
     .nn_input_frame_size = 39,
-    .raw_sample_count = 38,
+    .raw_sample_count = 77,
     .raw_samples_per_frame = 3,
-    .dsp_input_frame_size = 38 * 3,
+    .dsp_input_frame_size = 77 * 3,
     .input_width = 0,
     .input_height = 0,
     .input_frames = 0,
@@ -199,7 +199,7 @@ const ei_impulse_t impulse_1024993_1 = {
 
     .sensor = EI_CLASSIFIER_SENSOR_FUSION,
     .fusion_string = "velx + vely + velz",
-    .slice_size = (38/4),
+    .slice_size = (77/4),
     .slices_per_model_window = 4,
 
     .has_anomaly = EI_ANOMALY_TYPE_KMEANS,
