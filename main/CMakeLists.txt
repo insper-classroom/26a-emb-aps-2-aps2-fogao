@@ -9,17 +9,26 @@ include(FreeRTOS_Kernel_import.cmake)
 # Example running FreeRTOS on 1 core
 add_executable(pico_emb
     main.c
-    gesture.cpp
+    # gesture.cpp  # IA (Edge Impulse) removida do build temporariamente
     )
+
+# O protocolo (printf/getchar do main.c) sai pela USB nativa da Pico como
+# porta serial virtual (CDC). Antes o stdio ia para a UART (GP0/GP1) e só
+# aparecia como COM através do debug probe; com USB CDC, a própria USB da
+# Pico vira a porta COM e o controle funciona plugado direto, sem probe.
+pico_enable_stdio_usb(pico_emb 1)
+pico_enable_stdio_uart(pico_emb 0)
 
 target_include_directories(pico_emb PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     )
 
-# ─────────────── Edge Impulse: modelo de IA on-device ───────────────
-# O classificador roda na mesma Pico que o controlador. A camada de porting
-# já existe no SDK (porting/raspberry, feita para pico+FreeRTOS) e é ativada
-# pelos defines EI_PORTING_RASPBERRY=1 e FREERTOS_ENABLED.
+# ─────────────── Edge Impulse: REMOVIDO do build (temporário) ───────────────
+# A IA (gesture.cpp + Edge Impulse) foi tirada do binário porque seus
+# construtores estáticos de C++ rodavam antes do main() e travavam o boot,
+# impedindo a USB CDC de subir. Para reativar, descomente este bloco E o
+# gesture.cpp no add_executable acima.
+#[==[
 set(EI_ROOT ${CMAKE_CURRENT_LIST_DIR}/../ei-model)
 include(${EI_ROOT}/edge-impulse-sdk/cmake/utils.cmake)
 
@@ -55,15 +64,12 @@ target_sources(pico_emb PRIVATE
 include(${EI_ROOT}/edge-impulse-sdk/cmake/add_source.cmake)
 apply_predefined_sources(pico_emb USE_DSP)
 
-# Obs.: NÃO definimos FREERTOS_ENABLED de propósito. Com ele, a porting do EI
-# define seu próprio pvPortCalloc, que colide com o pvPortCalloc já presente
-# nesta versão do FreeRTOS-Kernel (heap_4.c). Sem ele, o EI usa malloc/calloc
-# do newlib — usados só pela task de inferência (uso single-thread, seguro).
 target_compile_definitions(pico_emb PRIVATE
     EI_PORTING_RASPBERRY=1
     TF_LITE_STATIC_MEMORY
     TF_LITE_DISABLE_X86_NEON
     )
+#]==]
 
 # Linking to FreeRTOS-Kernel-Heap4 means we use a dynamic heap for allocations
 target_link_libraries(pico_emb PRIVATE

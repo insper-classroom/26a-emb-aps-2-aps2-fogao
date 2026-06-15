@@ -39,9 +39,9 @@
 /* ───────────────────────── Pinos ─────────────────────────────────── */
 /* Botões (entradas digitais por interrupção) */
 const int BTN_PIN_PAUSE = 3; //red
-const int BTN_PIN_HOVERBOARD = 2; //blue
-const int BTN_PIN_IMU = 5; //white
-const int BTN_PIN_START = 4; //green
+const int BTN_PIN_HOVERBOARD = 5; //green 
+const int BTN_PIN_IMU = 2; //blue
+const int BTN_PIN_START = 4; //Não é usado
 
 const int PIN_VIBRA = 18; //Vibra
 
@@ -706,7 +706,31 @@ void audio_task(void *p) {
 }
 
 int main(void) {
+    /* ── Áudio: saída por PWM no AUDIO_PIN (DAC de 1 bit + filtro RC) ──
+     * Feito ANTES do stdio_init_all(): set_sys_clock_khz muda o clock do
+     * sistema, então o USB CDC precisa ser inicializado já com o clock
+     * final (176 MHz), senão a serial sai com baud/timing errados.
+     * A ISR PWM_IRQ_WRAP_0 dispara a cada wrap e alimenta a próxima
+     * amostra. clkdiv 8.0 com wrap 255 sobre 176 MHz dá ~11 kHz, taxa
+     * dos buffers em pause.h / power_up.h. */
+    set_sys_clock_khz(176000, true);
+    gpio_set_function(AUDIO_PIN, GPIO_FUNC_PWM);
+    int audio_pin_slice = pwm_gpio_to_slice_num(AUDIO_PIN);
+    pwm_clear_irq(audio_pin_slice);
+    pwm_set_irq_enabled(audio_pin_slice, true);
+    irq_set_exclusive_handler(PWM_IRQ_WRAP_0, pwm_interrupt_handler);
+    irq_set_enabled(PWM_IRQ_WRAP_0, true);
+
+    pwm_config config = pwm_get_default_config();
+    pwm_config_set_clkdiv(&config, 8.0f);
+    pwm_config_set_wrap(&config, 255);
+    pwm_init(audio_pin_slice, &config, true);
+    pwm_set_gpio_level(AUDIO_PIN, 0);
+
     /* Inicializações de stdio, botões e LED */
+ 
+ 
+    
     stdio_init_all();
 
     set_sys_clock_khz(176000, true); 
@@ -809,8 +833,9 @@ int main(void) {
     xTaskCreate(heartbeat_task, "hbeat", 512, NULL, 1, NULL);
     xTaskCreate(feedback_task, "feedback", 512, NULL, 2, NULL);
     xTaskCreate(audio_task, "audio", 1024, NULL, 2, NULL);
-    /* IA: prioridade baixa (1), abaixo do controle; stack grande p/ inferência. */
-    xTaskCreate(gesture_task, "gesture", 8192, NULL, 1, NULL);
+    /* IA (Edge Impulse) removida: travava o boot e impedia a USB CDC de subir.
+     * Reative junto com o bloco no main/CMakeLists.txt quando for investigar. */
+    /* xTaskCreate(gesture_task, "gesture", 8192, NULL, 1, NULL); */
 
     vTaskStartScheduler();
 

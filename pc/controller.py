@@ -23,14 +23,29 @@ import sys
 import threading
 
 import serial
+from serial.tools import list_ports
 import pydirectinput
 from pynput import keyboard
 
 # EOP definido no firmware (main.c: #define EOP '\n').
 EOP = "\n"
 
-# Porta serial padrão do Pico nesta máquina.
-DEFAULT_PORT = "COM7"
+# VID USB da Raspberry Pi: toda Pico (RP2040/RP2350) enumera com este
+# Vendor ID. Usado para achar a porta automaticamente, sem depender do
+# número da COM (que muda e deixa "fantasmas" de sessões antigas).
+RPI_VID = 0x2E8A
+
+# Porta serial padrão (fallback se a detecção automática não achar nada).
+DEFAULT_PORT = "COM8"
+
+
+def find_pico_port():
+    """Procura uma porta serial que seja uma Pico (VID 2E8A).
+    Retorna o nome da porta (ex: 'COM9') ou None se não achar."""
+    candidatos = [p for p in list_ports.comports() if p.vid == RPI_VID]
+    if candidatos:
+        return candidatos[0].device
+    return None
 
 # Baud rate é irrelevante para USB CDC (porta serial virtual), mas o
 # pyserial exige um valor. Qualquer número válido serve.
@@ -117,17 +132,27 @@ def on_release(key) -> None:
 def main() -> int:
     global _ser
     parser = argparse.ArgumentParser(description="Ponte Pico <-> Subway Surfers")
-    parser.add_argument("--port", default=DEFAULT_PORT,
-                        help=f"porta serial do Pico (padrão: {DEFAULT_PORT})")
+    parser.add_argument("--port", default=None,
+                        help="porta serial do Pico (padrão: detecção automática pelo VID)")
     parser.add_argument("--baud", type=int, default=BAUDRATE,
                         help="baud rate (ignorado em USB CDC)")
     args = parser.parse_args()
 
-    try:
-        _ser = serial.Serial(args.port, args.baud, timeout=1)
-    except serial.SerialException as exc:
-        print(f"Erro ao abrir {args.port}: {exc}", file=sys.stderr)
+    # Sem --port: acha a Pico sozinho pelo VID 2E8A (qualquer COM que ela criar).
+    port = args.port or find_pico_port()
+    if port is None:
+        disponiveis = [f"{p.device} ({p.description})" for p in list_ports.comports()]
+        print("Nenhuma Pico encontrada (VID 2E8A). Confira se o firmware com USB CDC "
+              "está gravado e a USB da Pico está ligada no PC.", file=sys.stderr)
+        print(f"Portas disponíveis agora: {disponiveis or 'nenhuma'}", file=sys.stderr)
         return 1
+
+    try:
+        _ser = serial.Serial(port, args.baud, timeout=1)
+    except serial.SerialException as exc:
+        print(f"Erro ao abrir {port}: {exc}", file=sys.stderr)
+        return 1
+    args.port = port  # para a mensagem de status abaixo
 
     # Escuta global do teclado para a tecla de teste 'm'.
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
