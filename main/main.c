@@ -161,12 +161,13 @@ QueueHandle_t xQueueStatus;
 QueueHandle_t xQueueFeedback;
 SemaphoreHandle_t xSemaphoreCalibrateImu;
 
-/* Áudio: um semáforo binário por som. O btn_task sinaliza (give) no aperto
- * do botão e a audio_task espera nos dois ao mesmo tempo via queue set,
- * substituindo as antigas flags globais por sinalização entre tasks. */
-SemaphoreHandle_t xSemaphoreAudioPause;
-SemaphoreHandle_t xSemaphoreAudioPowerUp;
-QueueSetHandle_t  xAudioQueueSet;
+/* Áudio sem variável global de estado: o som a tocar chega à audio_task por
+ * uma fila de comandos; as AMOSTRAS vão da audio_task para a PWM ISR por outra
+ * fila (a ISR consome com xQueueReceiveFromISR). Ambas são QueueHandle_t — sem
+ * buffer/cursor global compartilhado entre task e ISR. */
+typedef enum { AUDIO_PAUSE = 0, AUDIO_POWER_UP } audio_evt_t;
+QueueHandle_t xQueueAudioCmd;       /* btn_task → audio_task: qual som tocar */
+QueueHandle_t xQueueAudioSamples;   /* audio_task → PWM ISR: amostras (1 byte) */
 
 /* Mutex do barramento I2C: serializa os acessos à MPU6050 entre a mpu_task
  * (tilt/Fusion) e a gesture_task (IA), que leem a mesma IMU. */
@@ -185,58 +186,39 @@ static void set_rgb(bool r, bool g, bool b) {
 void controller_trigger_hoverboard(void) {
     game_cmd_t cmd = GAME_CMD_HOVERBOARD;
     xQueueSend(xQueueGameCmd, &cmd, 0);
-    xSemaphoreGive(xSemaphoreAudioPowerUp);
+    audio_evt_t snd = AUDIO_POWER_UP;
+    xQueueSend(xQueueAudioCmd, &snd, 0);
     feedback_evt_t fb = FEEDBACK_SHORT;
     xQueueSend(xQueueFeedback, &fb, 0);
 }
 
 /* ════════════════════════ Botões (ISR + task) ═══════════════════════ */
 
-/* Último instante (ms desde o boot) aceito por pino, para o debounce.
- * 30 = nº de GPIOs do banco 0 no RP2040/RP2350; indexado pelo gpio. */
-static volatile uint32_t last_press_ms[30];
-
-/* Estado lido pela PWM ISR para alimentar o DAC. A reprodução é armada
- * pela audio_task (via audio_play); a ISR apenas avança a posição e
- * silencia ao chegar no fim. Cada amostra é repetida 8x (>>3), igual ao
- * driver original. Mantidos volatile por serem compartilhados com a ISR. */
-static volatile const uint8_t *audio_data  = NULL;
-static volatile uint32_t       audio_ticks = 0;   /* total de ciclos PWM = LENGTH<<3 */
-static volatile uint32_t       audio_pos   = 0;   /* ciclo atual */
-
-/* Arma a reprodução de um buffer. Chamado só pela audio_task (contexto de
- * task). A ordem das escritas garante que a ISR nunca indexe o buffer novo
- * com o comprimento antigo: primeiro estaciona a posição no fim (ISR ociosa),
- * troca o buffer e só então libera com audio_pos = 0. */
-static void audio_play(const uint8_t *data, uint32_t length) {
-    audio_pos   = audio_ticks;   /* pos >= ticks ⇒ ISR não reproduz */
-    audio_data  = data;
-    audio_ticks = length << 3;
-    audio_pos   = 0;             /* libera a nova reprodução */
-}
-
-void pwm_interrupt_handler() {
+/* PWM ISR do áudio: a cada 8 wraps do PWM (taxa efetiva ~11 kHz) puxa a
+ * próxima amostra da fila xQueueAudioSamples e a aplica ao DAC; fila vazia ⇒
+ * silêncio. Todo o estado de reprodução (contador de repetição e amostra
+ * atual) é `static` LOCAL — escopo de função, sem variável global
+ * compartilhada entre a ISR e a task. */
+void pwm_interrupt_handler(void) {
     pwm_clear_irq(pwm_gpio_to_slice_num(AUDIO_PIN));
-    if (audio_pos < audio_ticks) {
-        /* repete cada amostra por 8 ciclos de PWM (>>3) */
-        pwm_set_gpio_level(AUDIO_PIN, audio_data[audio_pos >> 3]);
-        audio_pos++;
-    } else {
-        pwm_set_gpio_level(AUDIO_PIN, 0); /* silêncio ao terminar */
+    static uint8_t rep = 0;      /* repete cada amostra por 8 ciclos de PWM */
+    static uint8_t sample = 0;   /* amostra atual (0 = silêncio) */
+    if (rep == 0) {
+        uint8_t next;
+        BaseType_t woken = pdFALSE;
+        sample = (xQueueAudioSamples != NULL &&
+                  xQueueReceiveFromISR(xQueueAudioSamples, &next, &woken) == pdTRUE)
+                 ? next : 0;
+        portYIELD_FROM_ISR(woken);
     }
+    pwm_set_gpio_level(AUDIO_PIN, sample);
+    rep = (uint8_t)((rep + 1) & 7);
 }
 
 void btn_callback(uint gpio, uint32_t events) {
     if (events == GPIO_IRQ_EDGE_FALL) {
-        /* Debounce na ISR: descarta quiques dentro de DEBOUNCE_MS antes
-         * de ocupar a fila, garantindo 1 evento por aperto. */
-        uint32_t now = to_ms_since_boot(get_absolute_time());
-        if (now - last_press_ms[gpio] < DEBOUNCE_MS) {
-            return;
-        }
-        last_press_ms[gpio] = now;
-
-        /* ISR curta: apenas publica o GPIO acionado na fila.
+        /* ISR curta: só publica o GPIO acionado na fila. O debounce é feito no
+         * btn_task (estado local da task), sem variável global compartilhada.
          * (xQueueSendFromISR exige ponteiro para o item, por isso a var.) */
         uint32_t pin = gpio;
         BaseType_t higher_priority_woken = pdFALSE;
@@ -249,14 +231,25 @@ void btn_task(void *p) {
     (void)p;
     uint32_t btn = 0;
     game_cmd_t cmd;
+    /* Debounce por pino, em estado LOCAL da task (vive na pilha da task, não é
+     * global): descarta quiques dentro de DEBOUNCE_MS, garantindo 1 evento por
+     * aperto. 30 = nº de GPIOs do banco 0 no RP2040/RP2350; indexado pelo gpio. */
+    uint32_t last_press_ms[30] = {0};
     while (true) {
         if (xQueueReceive(xQueueBtn, &btn, portMAX_DELAY)) {
+            uint32_t now = to_ms_since_boot(get_absolute_time());
+            if (now - last_press_ms[btn] < DEBOUNCE_MS) {
+                continue;   /* quique: ignora */
+            }
+            last_press_ms[btn] = now;
+
             /* O LED é responsabilidade exclusiva do status_task; aqui só
              * publicamos comandos de jogo ou o pedido de recalibração. */
             if (btn == (uint32_t)BTN_PIN_PAUSE) {
                 cmd = GAME_CMD_PAUSE;
                 xQueueSend(xQueueGameCmd, &cmd, 0);
-                xSemaphoreGive(xSemaphoreAudioPause); /* toca som de pausar */
+                audio_evt_t snd = AUDIO_PAUSE;
+                xQueueSend(xQueueAudioCmd, &snd, 0); /* toca som de pausar */
             } else if (btn == (uint32_t)BTN_PIN_HOVERBOARD) {
                 /* Mesma ação que a IA dispara ao reconhecer a prancha. */
                 controller_trigger_hoverboard();
@@ -684,28 +677,41 @@ void feedback_task(void *p) {
 }
 
 /* ════════════════════════════════════════════════════════════════════
- * audio_task — ÚNICA dona da reprodução. Bloqueia no queue set esperando
- * qualquer um dos semáforos de áudio (pause/power-up). Ao ser sinalizada,
- * arma o buffer correspondente via audio_play(); a PWM ISR cuida de
- * alimentar o DAC amostra a amostra. Apertar um botão durante outro som
- * apenas troca o buffer (o som novo recomeça do início).
+ * audio_task — ÚNICA dona da reprodução. Espera em xQueueAudioCmd qual som
+ * tocar e então empurra as amostras do buffer (em flash) na fila
+ * xQueueAudioSamples, que a PWM ISR consome a ~11 kHz. A própria fila faz o
+ * pace: a task completa a fila e dorme um pouco enquanto a ISR drena. Não há
+ * buffer/cursor global — todo o estado é local ou trafega por fila.
  * ════════════════════════════════════════════════════════════════════ */
 void audio_task(void *p) {
     (void)p;
+    audio_evt_t e;
     for (;;) {
-        QueueSetMemberHandle_t active =
-            xQueueSelectFromSet(xAudioQueueSet, portMAX_DELAY);
-        if (active == (QueueSetMemberHandle_t)xSemaphoreAudioPause) {
-            xSemaphoreTake(xSemaphoreAudioPause, 0);
-            audio_play(WAV_DATA_PAUSE, WAV_DATA_LENGTH_PAUSE);
-        } else if (active == (QueueSetMemberHandle_t)xSemaphoreAudioPowerUp) {
-            xSemaphoreTake(xSemaphoreAudioPowerUp, 0);
-            audio_play(WAV_DATA_POWER_UP, WAV_DATA_LENGTH_POWER_UP);
+        if (xQueueReceive(xQueueAudioCmd, &e, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        const uint8_t *data = (e == AUDIO_POWER_UP) ? WAV_DATA_POWER_UP
+                                                    : WAV_DATA_PAUSE;
+        uint32_t len = (e == AUDIO_POWER_UP) ? WAV_DATA_LENGTH_POWER_UP
+                                             : WAV_DATA_LENGTH_PAUSE;
+        for (uint32_t i = 0; i < len; ) {
+            /* Completa a fila de amostras (envio não-bloqueante); quando enche,
+             * dorme 2 ms para a ISR drenar e volta a completar. Isso pace a
+             * reprodução sem busy-wait e sem travar o core. */
+            while (i < len && xQueueSend(xQueueAudioSamples, &data[i], 0) == pdTRUE) {
+                i++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(2));
         }
     }
 }
 
 int main(void) {
+    /* Fila de amostras criada ANTES da PWM: a ISR de PWM começa a disparar
+     * assim que pwm_init habilita o slice e já consome desta fila. 512 bytes
+     * (~46 ms a 11 kHz) dão folga para a audio_task completar entre os ciclos. */
+    xQueueAudioSamples = xQueueCreate(512, sizeof(uint8_t));
+
     /* ── Áudio: saída por PWM no AUDIO_PIN (DAC de 1 bit + filtro RC) ──
      * Feito ANTES do stdio_init_all(): set_sys_clock_khz muda o clock do
      * sistema, então o USB CDC precisa ser inicializado já com o clock
@@ -728,12 +734,10 @@ int main(void) {
     pwm_set_gpio_level(AUDIO_PIN, 0);
 
     /* Inicializações de stdio, botões e LED */
- 
- 
-    
     stdio_init_all();
 
-    set_sys_clock_khz(176000, true); 
+#if 0 /* BLOCO PWM DUPLICADO PELO MERGE — desativado (já há um igual acima, antes do stdio) */
+    set_sys_clock_khz(176000, true);
     gpio_set_function(AUDIO_PIN, GPIO_FUNC_PWM);
     int audio_pin_slice = pwm_gpio_to_slice_num(AUDIO_PIN);
     // Setup PWM interrupt to fire when PWM cycle is complete
@@ -761,6 +765,7 @@ int main(void) {
     pwm_init(audio_pin_slice, &config, true);
 
     pwm_set_gpio_level(AUDIO_PIN, 0);
+#endif /* fim do bloco PWM duplicado */
 
     gpio_init(RGB_PIN_R);
     gpio_set_dir(RGB_PIN_R, GPIO_OUT);
@@ -809,33 +814,53 @@ int main(void) {
     xQueueFeedback = xQueueCreate(16, sizeof(feedback_evt_t));
     xSemaphoreCalibrateImu = xSemaphoreCreateBinary();
 
-    /* Áudio: semáforos vazios (criados sem token) agrupados num queue set,
-     * para a audio_task esperar nos dois ao mesmo tempo. Os membros devem
-     * ser adicionados ao set antes de qualquer give. */
-    xSemaphoreAudioPause   = xSemaphoreCreateBinary();
-    xSemaphoreAudioPowerUp = xSemaphoreCreateBinary();
-    xAudioQueueSet = xQueueCreateSet(2);
-    xQueueAddToSet(xSemaphoreAudioPause, xAudioQueueSet);
-    xQueueAddToSet(xSemaphoreAudioPowerUp, xAudioQueueSet);
+    /* Fila de comando do áudio: btn_task/controller_trigger_hoverboard
+     * publicam qual som tocar; a audio_task consome. (A fila de amostras já
+     * foi criada no topo do main, antes da PWM.) */
+    xQueueAudioCmd = xQueueCreate(4, sizeof(audio_evt_t));
 
     /* Mutex de I2C + inicialização única da MPU (antes do scheduler, sem
      * concorrência), compartilhada entre mpu_task e gesture_task. */
     xMutexI2C = xSemaphoreCreateMutex();
     mpu6050_init();
 
-    /* Tasks */
-    xTaskCreate(mpu_task, "mpu", 4096, NULL, 2, NULL);
-    xTaskCreate(btn_task, "btn task", 4096, NULL, 2, NULL);
-    xTaskCreate(game_command_task, "gamecmd", 2048, NULL, 2, NULL);
-    xTaskCreate(uart_tx_task, "uarttx", 2048, NULL, 2, NULL);
-    xTaskCreate(uart_rx_task, "uartrx", 2048, NULL, 2, NULL);
-    xTaskCreate(status_task, "status", 1024, NULL, 2, NULL);
-    xTaskCreate(heartbeat_task, "hbeat", 512, NULL, 1, NULL);
-    xTaskCreate(feedback_task, "feedback", 512, NULL, 2, NULL);
-    xTaskCreate(audio_task, "audio", 1024, NULL, 2, NULL);
+    /* Tasks — guardamos os handles para fixar a afinidade de core (SMP) abaixo. */
+    TaskHandle_t hMpu, hBtn, hGameCmd, hUartTx, hUartRx, hStatus, hHeartbeat, hFeedback, hAudio;
+    xTaskCreate(mpu_task, "mpu", 4096, NULL, 2, &hMpu);
+    xTaskCreate(btn_task, "btn task", 4096, NULL, 2, &hBtn);
+    xTaskCreate(game_command_task, "gamecmd", 2048, NULL, 2, &hGameCmd);
+    xTaskCreate(uart_tx_task, "uarttx", 2048, NULL, 2, &hUartTx);
+    xTaskCreate(uart_rx_task, "uartrx", 2048, NULL, 2, &hUartRx);
+    xTaskCreate(status_task, "status", 1024, NULL, 2, &hStatus);
+    xTaskCreate(heartbeat_task, "hbeat", 512, NULL, 1, &hHeartbeat);
+    xTaskCreate(feedback_task, "feedback", 512, NULL, 2, &hFeedback);
+    xTaskCreate(audio_task, "audio", 1024, NULL, 2, &hAudio);
     /* IA (Edge Impulse) removida: travava o boot e impedia a USB CDC de subir.
      * Reative junto com o bloco no main/CMakeLists.txt quando for investigar. */
     /* xTaskCreate(gesture_task, "gesture", 8192, NULL, 1, NULL); */
+
+#if (configNUMBER_OF_CORES > 1)
+    /* ── Distribuição SMP entre os 2 cores do RP2350 ──────────────────────
+     * Máscara de afinidade: 0x01 = Core 0, 0x02 = Core 1.
+     *
+     * Core 0 — comunicação + ISRs deste core: a USB CDC e as interrupções de
+     *   PWM (áudio) e GPIO (botões) são habilitadas no Core 0 dentro do main().
+     *   Mantemos uart_tx/uart_rx/heartbeat aqui; audio_task junto da PWM ISR
+     *   (evita corrida cross-core nos buffers de áudio) e btn_task junto da
+     *   GPIO ISR.
+     * Core 1 — isola a carga pesada (Fusion AHRS a 100 Hz) e o restante do
+     *   estado: mpu, game_command, status, feedback. */
+    vTaskCoreAffinitySet(hUartTx,    (UBaseType_t)0x01);
+    vTaskCoreAffinitySet(hUartRx,    (UBaseType_t)0x01);
+    vTaskCoreAffinitySet(hHeartbeat, (UBaseType_t)0x01);
+    vTaskCoreAffinitySet(hAudio,     (UBaseType_t)0x01);
+    vTaskCoreAffinitySet(hBtn,       (UBaseType_t)0x01);
+
+    vTaskCoreAffinitySet(hMpu,       (UBaseType_t)0x02);
+    vTaskCoreAffinitySet(hGameCmd,   (UBaseType_t)0x02);
+    vTaskCoreAffinitySet(hStatus,    (UBaseType_t)0x02);
+    vTaskCoreAffinitySet(hFeedback,  (UBaseType_t)0x02);
+#endif
 
     vTaskStartScheduler();
 

@@ -80,10 +80,11 @@ target_link_libraries(pico_emb PRIVATE
     Fusion
     pico_stdlib
     )
-# Set the nunber of cores to 1.
-# This defaults to 2 in FreeRTOSConfig_examples_common.h if not defined in here
+# SMP: roda o FreeRTOS nos 2 cores do RP2350. A afinidade de cada task é
+# fixada em main.c via vTaskCoreAffinitySet (configUSE_CORE_AFFINITY é ligado
+# automaticamente pela FreeRTOSConfig.h quando há mais de 1 core).
 target_compile_definitions(pico_emb PRIVATE
-    configNUMBER_OF_CORES=1
+    configNUMBER_OF_CORES=2
     )
 if(PICO_CYW43_SUPPORTED)
     # For led support on pico_w
